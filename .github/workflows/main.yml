@@ -1,18 +1,127 @@
-name: RDP Yeniden Başlat
+name: RDP Ana
 
 on:
+  workflow_dispatch:
   schedule:
     - cron: '0 */5 * * *'  # Her 5 saatte bir
-  workflow_dispatch:
 
 jobs:
-  restart:
-    runs-on: ubuntu-latest
+  rdp:
+    runs-on: windows-latest
+    timeout-minutes: 43200
+    
     steps:
-      - name: RDP'yi Yeniden Başlat
+      - name: RDP Kurulumu
         run: |
-          curl -X POST \
-            -H "Authorization: token ${{ secrets.GITHUB_TOKEN }}" \
-            -H "Accept: application/vnd.github.v3+json" \
-            https://api.github.com/repos/${{ github.repository }}/actions/workflows/rdp-main.yml/dispatches \
-            -d '{"ref":"main"}'
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' -Name "fDenyTSConnections" -Value 0
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -Name "UserAuthentication" -Value 0
+          netsh advfirewall firewall add rule name="RDP" dir=in action=allow protocol=TCP localport=3389
+          
+          $password = "SecurePassword123!"
+          $securePass = ConvertTo-SecureString $password -AsPlainText -Force
+          New-LocalUser -Name "RDP" -Password $securePass -AccountNeverExpires
+          Add-LocalGroupMember -Group "Administrators" -Member "RDP"
+          Add-LocalGroupMember -Group "Remote Desktop Users" -Member "RDP"
+          
+          echo "RDP_CREDS=User:RDP|Password:$password" >> $env:GITHUB_ENV
+          
+      - name: Python Kurulumu
+        run: |
+          choco install python --version=3.11 -y
+          python -m pip install --upgrade pip
+          pip install psutil requests
+          
+      - name: RDP Kalıcı Tutucu
+        run: |
+          python -c "
+          import time
+          import threading
+          import subprocess
+          import psutil
+          import socket
+          import requests
+          import os
+          import sys
+          from datetime import datetime
+          
+          class RDPKeepAlive:
+              def __init__(self):
+                  self.running = True
+                  self.restart_count = 0
+                  self.max_restarts = 9999
+                  self.check_interval = 30
+              
+              def log(self, msg):
+                  now = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+                  print(f'[{now}] {msg}')
+                  sys.stdout.flush()
+              
+              def is_rdp_running(self):
+                  try:
+                      result = subprocess.run(['sc', 'query', 'TermService'], capture_output=True, text=True, timeout=5)
+                      return 'RUNNING' in result.stdout
+                  except Exception as e:
+                      self.log(f'Kontrol hatasi: {e}')
+                      return False
+              
+              def restart_rdp(self):
+                  try:
+                      self.log('RDP servisi yeniden baslatiliyor...')
+                      subprocess.run(['net', 'stop', 'TermService'], capture_output=True, timeout=10)
+                      time.sleep(2)
+                      subprocess.run(['net', 'start', 'TermService'], capture_output=True, timeout=10)
+                      self.restart_count += 1
+                      self.log(f'RDP servisi yeniden baslatildi! (#{self.restart_count})')
+                      return True
+                  except Exception as e:
+                      self.log(f'Yeniden baslatma hatasi: {e}')
+                      return False
+              
+              def ensure_rdp(self):
+                  if not self.is_rdp_running():
+                      self.log('RDP calismiyor! Yeniden baslatiliyor...')
+                      return self.restart_rdp()
+                  return True
+              
+              def keep_alive_loop(self):
+                  self.log('RDP Kalici Tutucu Baslatildi!')
+                  self.log(f'Kontrol araligi: {self.check_interval} saniye')
+                  counter = 0
+                  while self.running and self.restart_count < self.max_restarts:
+                      try:
+                          counter += 1
+                          if not self.ensure_rdp():
+                              self.log('RDP kontrolu basarisiz!')
+                          if counter % 2 == 0:
+                              status = 'CALISIYOR' if self.is_rdp_running() else 'DURMUS'
+                              self.log(f'RDP Durumu: {status} | Yeniden Baslatma: {self.restart_count}')
+                          if counter % 10 == 0:
+                              try:
+                                  cpu = psutil.cpu_percent()
+                                  mem = psutil.virtual_memory()
+                                  self.log(f'CPU: {cpu}% | RAM: {mem.used/1024**3:.1f}GB / {mem.total/1024**3:.1f}GB')
+                              except:
+                                  pass
+                          if counter % 60 == 0:
+                              try:
+                                  requests.get('https://api.github.com', timeout=5)
+                              except:
+                                  pass
+                          time.sleep(self.check_interval)
+                      except Exception as e:
+                          self.log(f'Dongu hatasi: {e}')
+                          time.sleep(10)
+              
+              def start(self):
+                  self.log('RDP Kalici Tutucu baslatiliyor...')
+                  threading.Thread(target=self.keep_alive_loop, daemon=True).start()
+                  try:
+                      while self.running:
+                          time.sleep(60)
+                  except KeyboardInterrupt:
+                      self.running = False
+                      self.log('Kapatiliyor...')
+          
+          if __name__ == '__main__':
+              RDPKeepAlive().start()
+          "
